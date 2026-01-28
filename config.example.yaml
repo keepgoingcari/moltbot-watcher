@@ -1,0 +1,51 @@
+# Moltbot Watcher Configuration
+# Copy this file to ~/.config/moltbot-watcher/config.yaml
+# and fill in your Telegram bot token and chat ID
+
+telegram:
+  # Get from @BotFather on Telegram
+  bot_token: "YOUR_BOT_TOKEN"
+  # Your Telegram user ID (get from @userinfobot)
+  chat_id: "YOUR_CHAT_ID"
+
+watch:
+  # Glob patterns for Moltbot session files
+  paths:
+    - "~/.moltbot/agents/*/sessions/*.jsonl"
+
+  # Alert level:
+  #   all        - Alert on every incoming message
+  #   new_sender - Alert on first message from unknown senders + suspicious
+  #   suspicious - Alert only on pattern matches
+  #   digest     - Batch alerts every N minutes
+  alert_level: "new_sender"
+
+  # For digest mode: how often to send batched alerts
+  digest_interval_minutes: 15
+
+patterns:
+  # Regex patterns that trigger suspicious alerts
+  # These detect common prompt injection attempts
+  suspicious:
+    - "ignore.*instruction"
+    - "ignore.*previous"
+    - "system.*prompt"
+    - "pretend.*you.*are"
+    - "act.*as.*if"
+    - "forget.*everything"
+    - "new.*instruction"
+    - "base64"
+    - "eval\\s*\\("
+
+  # Senders to completely ignore (no alerts, no logging)
+  blocked_senders: []
+
+moltbot:
+  # Command to stop Moltbot gateway
+  stop_command: "moltbot gateway stop"
+
+  # Command to start Moltbot gateway
+  start_command: "moltbot gateway start"
+
+  # PID file location (for status checks)
+  pid_file: "/tmp/moltbot/gateway.pid"

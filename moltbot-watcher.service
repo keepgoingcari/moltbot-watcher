@@ -1,0 +1,25 @@
+[Unit]
+Description=Moltbot Security Watcher
+After=network.target
+
+[Service]
+Type=simple
+# Change to your username
+User=your-user
+# Path to your installation
+WorkingDirectory=/home/your-user/moltbot-watcher
+# Use the virtual environment python
+ExecStart=/home/your-user/moltbot-watcher/venv/bin/python moltbot_watcher.py
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=/tmp
+
+[Install]
+WantedBy=multi-user.target
