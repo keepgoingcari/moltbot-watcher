@@ -1,21 +1,14 @@
 #!/usr/bin/env python3
 """
-Moltbot Security Watcher
-
-Monitors Moltbot session transcripts and provides:
-- Real-time Telegram alerts when new input is received
-- Suspicious input flagging based on configurable patterns
-- Remote kill switch via Telegram command
+Moltbot Watcher - Monitor Moltbot conversations and send alerts via Telegram
 """
 
 import asyncio
-import json
 import logging
 import os
-import re
 import subprocess
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
@@ -34,548 +27,342 @@ logger = logging.getLogger(__name__)
 
 
 class Config:
-    """Configuration manager for the watcher."""
+    """Load and manage configuration."""
 
-    def __init__(self, config_path: str = None):
+    def __init__(self, config_path: Optional[str] = None):
         if config_path is None:
-            config_path = os.path.expanduser("~/.config/moltbot-watcher/config.yaml")
+            config_path = os.path.expanduser(
+                "~/.config/moltbot-watcher/config.yaml"
+            )
 
         with open(config_path) as f:
-            self._config = yaml.safe_load(f)
+            self.data = yaml.safe_load(f)
 
-        self.bot_token = self._config["telegram"]["bot_token"]
-        self.chat_id = str(self._config["telegram"]["chat_id"])
-        self.watch_paths = [
-            os.path.expanduser(p) for p in self._config["watch"]["paths"]
-        ]
-        self.alert_level = self._config["watch"].get("alert_level", "new_sender")
-        self.digest_interval = self._config["watch"].get("digest_interval_minutes", 15)
-        self.suspicious_patterns = [
-            re.compile(p, re.IGNORECASE)
-            for p in self._config["patterns"].get("suspicious", [])
-        ]
-        self.blocked_senders = set(self._config["patterns"].get("blocked_senders", []))
-        self.stop_command = self._config["moltbot"].get(
-            "stop_command", "moltbot gateway stop"
+        self.bot_token = self.data["telegram"]["bot_token"]
+        self.chat_id = str(self.data["telegram"]["chat_id"])
+        self.watch_paths = self.data.get("watch", {}).get("paths", [])
+        self.alert_level = self.data.get("watch", {}).get(
+            "alert_level", "new_sender"
         )
-        self.start_command = self._config["moltbot"].get(
-            "start_command", "moltbot gateway start"
-        )
-        self.pid_file = self._config["moltbot"].get(
-            "pid_file", "/tmp/moltbot/gateway.pid"
-        )
+        self.commands = self.data.get("commands", {})
+        self.alerts = self.data.get("alerts", {})
 
 
-class MoltbotWatcher:
-    """Main watcher class that coordinates file monitoring and Telegram bot."""
+class SessionWatcher(FileSystemEventHandler):
+    """Watch for new session files and messages."""
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, bot_app: Application):
         self.config = config
-        self.known_senders: set[str] = set()
-        self.file_positions: dict[str, int] = {}
-        self.muted_until: Optional[datetime] = None
-        self.recent_inputs: list[dict] = []
-        self.digest_queue: list[dict] = []
-        self.app: Optional[Application] = None
+        self.bot_app = bot_app
+        self.known_senders = set()
+        self.watched_files = {}
+        self._initialize_file_positions()
 
-    def is_muted(self) -> bool:
-        """Check if alerts are currently muted."""
-        if self.muted_until is None:
-            return False
-        if datetime.now() >= self.muted_until:
-            self.muted_until = None
-            return False
-        return True
+    def _initialize_file_positions(self):
+        """Set file positions to EOF for existing files to avoid replaying history."""
+        import glob
+        for path_pattern in self.config.watch_paths:
+            expanded = os.path.expanduser(path_pattern)
+            for filepath in glob.glob(expanded):
+                if os.path.isfile(filepath):
+                    size = os.path.getsize(filepath)
+                    self.watched_files[filepath] = size
+                    logger.info(f"Initialized {filepath} at position {size}")
 
-    def check_suspicious(self, message: str) -> list[str]:
-        """Check message against suspicious patterns."""
-        matches = []
-        for pattern in self.config.suspicious_patterns:
-            if pattern.search(message):
-                matches.append(pattern.pattern)
-        return matches
-
-    def is_moltbot_running(self) -> bool:
-        """Check if Moltbot gateway is running."""
-        try:
-            result = subprocess.run(
-                ["pgrep", "-f", "moltbot"],
-                capture_output=True,
-                text=True,
-            )
-            return result.returncode == 0
-        except Exception:
-            return False
-
-    def kill_moltbot(self) -> tuple[bool, str]:
-        """Stop the Moltbot gateway."""
-        try:
-            # Try the configured stop command first
-            result = subprocess.run(
-                self.config.stop_command.split(),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                return True, "Moltbot stopped via CLI"
-
-            # Fallback to pkill
-            result = subprocess.run(
-                ["pkill", "-f", "moltbot"],
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                return True, "Moltbot stopped via pkill"
-
-            return False, f"Failed to stop: {result.stderr}"
-        except subprocess.TimeoutExpired:
-            return False, "Stop command timed out"
-        except Exception as e:
-            return False, f"Error: {e}"
-
-    def start_moltbot(self) -> tuple[bool, str]:
-        """Start the Moltbot gateway."""
-        try:
-            result = subprocess.run(
-                self.config.start_command.split(),
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            if result.returncode == 0:
-                return True, "Moltbot started"
-            return False, f"Failed to start: {result.stderr}"
-        except subprocess.TimeoutExpired:
-            return False, "Start command timed out"
-        except Exception as e:
-            return False, f"Error: {e}"
-
-    async def send_alert(self, message: str):
-        """Send an alert message via Telegram."""
-        if self.is_muted():
-            logger.info("Alert suppressed (muted)")
+    def on_created(self, event):
+        """Handle new file creation."""
+        if event.is_directory:
             return
 
-        if self.app is None:
-            logger.error("Telegram app not initialized")
+        if event.src_path.endswith(".jsonl"):
+            logger.info(f"New session file: {event.src_path}")
+            asyncio.run(self._process_new_file(event.src_path))
+
+    def on_modified(self, event):
+        """Handle file modifications."""
+        if event.is_directory:
             return
 
+        if event.src_path.endswith(".jsonl"):
+            asyncio.run(self._process_modified_file(event.src_path))
+
+    async def _process_new_file(self, filepath: str):
+        """Process a newly created session file."""
         try:
-            await self.app.bot.send_message(
-                chat_id=self.config.chat_id,
-                text=message,
-                parse_mode="HTML",
+            with open(filepath) as f:
+                lines = f.readlines()
+                if lines:
+                    # Check first line for sender info
+                    import json
+
+                    first_msg = json.loads(lines[0])
+                    sender = first_msg.get("sender", {})
+                    sender_id = sender.get("id", "unknown")
+
+                    if sender_id not in self.known_senders:
+                        self.known_senders.add(sender_id)
+                        await self._send_alert(
+                            f"🆕 New sender: {sender.get('name', sender_id)}\n"
+                            f"File: {Path(filepath).name}"
+                        )
+        except Exception as e:
+            logger.error(f"Error processing new file: {e}")
+
+    async def _process_modified_file(self, filepath: str):
+        """Process changes to an existing session file."""
+        last_pos = self.watched_files.get(filepath, 0)
+
+        try:
+            with open(filepath) as f:
+                f.seek(last_pos)
+                new_content = f.read()
+                self.watched_files[filepath] = f.tell()
+
+                if new_content.strip() and self.config.alert_level == "all":
+                    import json
+
+                    for line in new_content.strip().splitlines():
+                        if line:
+                            try:
+                                msg = json.loads(line)
+                                msg_data = msg.get("message", {})
+                                role = msg_data.get("role", "unknown")
+                                content_arr = msg_data.get("content", [])
+
+                                # Extract text from content array
+                                text = ""
+                                if isinstance(content_arr, list):
+                                    for item in content_arr:
+                                        if isinstance(item, dict) and item.get("type") == "text":
+                                            text = item.get("text", "")[:300]
+                                            break
+                                elif isinstance(content_arr, str):
+                                    text = content_arr[:300]
+
+                                # Only alert on user messages
+                                if role == "user" and text:
+                                    await self._send_alert(f"💬 {text}")
+                            except json.JSONDecodeError:
+                                pass
+        except Exception as e:
+            logger.error(f"Error processing modified file: {e}")
+
+    async def _send_alert(self, message: str):
+        """Send alert to admin via Telegram."""
+        try:
+            await self.bot_app.bot.send_message(
+                chat_id=self.config.chat_id, text=message
             )
         except Exception as e:
             logger.error(f"Failed to send alert: {e}")
 
-    def format_alert(self, entry: dict, is_suspicious: bool, flags: list[str]) -> str:
-        """Format an alert message for Telegram."""
-        sender = entry.get("sender", "unknown")
-        channel = entry.get("channel", "unknown")
-        message = entry.get("message", "")[:500]  # Truncate long messages
-        timestamp = entry.get("timestamp", datetime.now().isoformat())
 
-        is_new_sender = sender not in self.known_senders
+class WatcherBot:
+    """Telegram bot for receiving commands and sending alerts."""
 
-        if is_suspicious:
-            header = "<b>SUSPICIOUS INPUT DETECTED</b>"
-        else:
-            header = "<b>MOLTBOT INPUT</b>"
+    def __init__(self, config: Config):
+        self.config = config
+        self.app = Application.builder().token(config.bot_token).build()
+        self.watcher: Optional[SessionWatcher] = None
+        self.observer: Optional[Observer] = None
 
-        sender_label = f"{sender} (NEW)" if is_new_sender else sender
+        # Register command handlers
+        self.app.add_handler(CommandHandler("start", self.cmd_start))
+        self.app.add_handler(CommandHandler("status", self.cmd_status))
+        self.app.add_handler(CommandHandler("kill", self.cmd_kill))
+        self.app.add_handler(CommandHandler("restart", self.cmd_restart))
+        self.app.add_handler(CommandHandler("logs", self.cmd_logs))
+        self.app.add_handler(CommandHandler("help", self.cmd_help))
 
-        alert = f"""{header}
+    async def cmd_start(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /start command."""
+        if str(update.effective_chat.id) != self.config.chat_id:
+            await update.message.reply_text("Unauthorized.")
+            return
 
-<b>Channel:</b> {channel}
-<b>Sender:</b> {sender_label}
-<b>Time:</b> {timestamp}
+        await update.message.reply_text(
+            "🤖 Moltbot Watcher active!\n\n"
+            "Commands:\n"
+            "/status - Check moltbot status\n"
+            "/kill - Stop moltbot\n"
+            "/restart - Restart moltbot\n"
+            "/logs - View recent logs\n"
+            "/help - Show this message"
+        )
 
-<b>Message:</b>
-<code>{message}</code>
+    async def cmd_help(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /help command."""
+        await self.cmd_start(update, context)
 
-<b>Flags:</b>"""
+    async def cmd_status(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /status command."""
+        if str(update.effective_chat.id) != self.config.chat_id:
+            return
 
-        if flags:
-            for flag in flags:
-                alert += f"\n  - {flag}"
-        else:
-            alert += " None"
+        if not self.config.commands.get("status", {}).get("enabled", True):
+            await update.message.reply_text("Status command disabled.")
+            return
 
-        alert += "\n\nReply /kill to stop Moltbot"
-
-        return alert
-
-    def process_jsonl_entry(self, entry: dict) -> Optional[dict]:
-        """Process a JSONL entry and determine if it should trigger an alert."""
-        # Skip non-input entries
-        if entry.get("type") != "input" and "message" not in entry:
-            return None
-
-        sender = entry.get("sender", "unknown")
-        message = entry.get("message", "")
-
-        # Check if sender is blocked
-        if sender in self.config.blocked_senders:
-            logger.info(f"Blocked sender: {sender}")
-            return None
-
-        # Check for suspicious patterns
-        suspicious_matches = self.check_suspicious(message)
-        is_suspicious = len(suspicious_matches) > 0
-        is_new_sender = sender not in self.known_senders
-
-        # Determine if we should alert based on alert level
-        should_alert = False
-        if self.config.alert_level == "all":
-            should_alert = True
-        elif self.config.alert_level == "new_sender":
-            should_alert = is_new_sender or is_suspicious
-        elif self.config.alert_level == "suspicious":
-            should_alert = is_suspicious
-        elif self.config.alert_level == "digest":
-            # Queue for digest
-            self.digest_queue.append(entry)
-            return None
-
-        if should_alert:
-            flags = []
-            if suspicious_matches:
-                flags.extend([f'Pattern: "{p}"' for p in suspicious_matches])
-            if is_new_sender:
-                flags.append("Unknown sender")
-
-            # Track sender
-            self.known_senders.add(sender)
-
-            # Track recent inputs
-            self.recent_inputs.append(entry)
-            if len(self.recent_inputs) > 10:
-                self.recent_inputs.pop(0)
-
-            return {
-                "entry": entry,
-                "is_suspicious": is_suspicious,
-                "flags": flags,
-            }
-
-        # Track sender even if no alert
-        self.known_senders.add(sender)
-        return None
-
-    async def handle_file_change(self, file_path: str):
-        """Handle a change to a watched JSONL file."""
         try:
-            # Get current position
-            current_pos = self.file_positions.get(file_path, 0)
+            result = subprocess.run(
+                ["systemctl", "is-active", "moltbot"],
+                capture_output=True,
+                text=True,
+            )
+            status = result.stdout.strip()
 
-            with open(file_path) as f:
-                # Seek to last known position
-                f.seek(current_pos)
+            if status == "active":
+                emoji = "✅"
+            elif status == "inactive":
+                emoji = "⏹️"
+            else:
+                emoji = "❌"
 
-                # Read new lines
-                for line in f:
-                    line = line.strip()
-                    if not line:
-                        continue
-
-                    try:
-                        entry = json.loads(line)
-                        result = self.process_jsonl_entry(entry)
-                        if result:
-                            alert_msg = self.format_alert(
-                                result["entry"],
-                                result["is_suspicious"],
-                                result["flags"],
-                            )
-                            await self.send_alert(alert_msg)
-                    except json.JSONDecodeError:
-                        logger.warning(f"Invalid JSON in {file_path}: {line[:50]}")
-
-                # Update position
-                self.file_positions[file_path] = f.tell()
-
+            await update.message.reply_text(f"{emoji} Moltbot status: {status}")
         except Exception as e:
-            logger.error(f"Error processing {file_path}: {e}")
+            await update.message.reply_text(f"Error checking status: {e}")
 
-
-class FileChangeHandler(FileSystemEventHandler):
-    """Handles file system events from watchdog."""
-
-    def __init__(self, watcher: MoltbotWatcher, loop: asyncio.AbstractEventLoop):
-        self.watcher = watcher
-        self.loop = loop
-
-    def on_modified(self, event):
-        if event.is_directory:
+    async def cmd_kill(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /kill command."""
+        if str(update.effective_chat.id) != self.config.chat_id:
             return
-        if event.src_path.endswith(".jsonl"):
-            asyncio.run_coroutine_threadsafe(
-                self.watcher.handle_file_change(event.src_path),
-                self.loop,
-            )
 
-    def on_created(self, event):
-        if event.is_directory:
+        if not self.config.commands.get("kill", {}).get("enabled", True):
+            await update.message.reply_text("Kill command disabled.")
             return
-        if event.src_path.endswith(".jsonl"):
-            # Initialize position for new file
-            self.watcher.file_positions[event.src_path] = 0
-            asyncio.run_coroutine_threadsafe(
-                self.watcher.handle_file_change(event.src_path),
-                self.loop,
-            )
 
+        service = self.config.commands.get("kill", {}).get(
+            "service_name", "moltbot"
+        )
 
-def is_authorized(update: Update, config: Config) -> bool:
-    """Check if the message is from an authorized user."""
-    return str(update.effective_chat.id) == config.chat_id
-
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /status command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    running = watcher.is_moltbot_running()
-    status = "running" if running else "stopped"
-    muted = "Yes" if watcher.is_muted() else "No"
-    known = len(watcher.known_senders)
-
-    await update.message.reply_text(
-        f"<b>Moltbot Watcher Status</b>\n\n"
-        f"Moltbot: {status}\n"
-        f"Alerts muted: {muted}\n"
-        f"Known senders: {known}\n"
-        f"Alert level: {watcher.config.alert_level}",
-        parse_mode="HTML",
-    )
-
-
-async def cmd_kill(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /kill command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    success, message = watcher.kill_moltbot()
-    if success:
-        await update.message.reply_text(f"Moltbot stopped: {message}")
-    else:
-        await update.message.reply_text(f"Failed to stop Moltbot: {message}")
-
-
-async def cmd_start_moltbot(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /start_moltbot command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    success, message = watcher.start_moltbot()
-    if success:
-        await update.message.reply_text(f"Moltbot started: {message}")
-    else:
-        await update.message.reply_text(f"Failed to start Moltbot: {message}")
-
-
-async def cmd_mute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /mute command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    minutes = 30  # Default
-    if context.args:
         try:
-            minutes = int(context.args[0])
-        except ValueError:
-            await update.message.reply_text("Invalid minutes. Usage: /mute [minutes]")
+            subprocess.run(["sudo", "systemctl", "stop", service], check=True)
+            await update.message.reply_text(f"⏹️ Stopped {service}")
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(f"Failed to stop: {e}")
+
+    async def cmd_restart(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /restart command."""
+        if str(update.effective_chat.id) != self.config.chat_id:
             return
 
-    watcher.muted_until = datetime.now() + timedelta(minutes=minutes)
-    await update.message.reply_text(f"Alerts muted for {minutes} minutes")
+        if not self.config.commands.get("restart", {}).get("enabled", True):
+            await update.message.reply_text("Restart command disabled.")
+            return
+
+        service = self.config.commands.get("restart", {}).get(
+            "service_name", "moltbot"
+        )
+
+        try:
+            subprocess.run(
+                ["sudo", "systemctl", "restart", service], check=True
+            )
+            await update.message.reply_text(f"🔄 Restarted {service}")
+        except subprocess.CalledProcessError as e:
+            await update.message.reply_text(f"Failed to restart: {e}")
+
+    async def cmd_logs(
+        self, update: Update, context: ContextTypes.DEFAULT_TYPE
+    ):
+        """Handle /logs command."""
+        if str(update.effective_chat.id) != self.config.chat_id:
+            return
+
+        if not self.config.commands.get("logs", {}).get("enabled", True):
+            await update.message.reply_text("Logs command disabled.")
+            return
+
+        lines = self.config.commands.get("logs", {}).get("lines", 20)
+
+        try:
+            result = subprocess.run(
+                ["journalctl", "-u", "moltbot", "-n", str(lines), "--no-pager"],
+                capture_output=True,
+                text=True,
+            )
+            logs = result.stdout[-4000:]  # Telegram message limit
+            await update.message.reply_text(f"📜 Recent logs:\n```\n{logs}\n```")
+        except Exception as e:
+            await update.message.reply_text(f"Failed to get logs: {e}")
+
+    def start_file_watcher(self):
+        """Start watching session files."""
+        self.watcher = SessionWatcher(self.config, self.app)
+        self.observer = Observer()
+
+        for path_pattern in self.config.watch_paths:
+            # Expand path and get directory
+            expanded = os.path.expanduser(path_pattern)
+            # Watch parent directory (glob patterns won't work directly)
+            watch_dir = str(Path(expanded).parent.parent.parent)
+
+            if os.path.exists(watch_dir):
+                self.observer.schedule(
+                    self.watcher, watch_dir, recursive=True
+                )
+                logger.info(f"Watching: {watch_dir}")
+            else:
+                logger.warning(f"Watch path does not exist: {watch_dir}")
+
+        self.observer.start()
+
+    def run(self):
+        """Run the bot."""
+        logger.info("Starting Moltbot Watcher...")
+
+        # Start file watcher
+        self.start_file_watcher()
+
+        # Send startup message
+        async def send_startup():
+            await self.app.bot.send_message(
+                chat_id=self.config.chat_id,
+                text=f"🟢 Moltbot Watcher started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}",
+            )
+
+        asyncio.get_event_loop().run_until_complete(send_startup())
+
+        # Run bot
+        self.app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 
-async def cmd_unmute(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /unmute command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    watcher.muted_until = None
-    await update.message.reply_text("Alerts unmuted")
-
-
-async def cmd_recent(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /recent command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    if not watcher.recent_inputs:
-        await update.message.reply_text("No recent inputs")
-        return
-
-    msg = "<b>Recent Inputs</b>\n\n"
-    for i, entry in enumerate(watcher.recent_inputs[-5:], 1):
-        sender = entry.get("sender", "unknown")
-        message = entry.get("message", "")[:100]
-        msg += f"{i}. <b>{sender}</b>: {message}\n\n"
-
-    await update.message.reply_text(msg, parse_mode="HTML")
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle /help command."""
-    watcher: MoltbotWatcher = context.bot_data["watcher"]
-
-    if not is_authorized(update, watcher.config):
-        await update.message.reply_text("Unauthorized")
-        return
-
-    await update.message.reply_text(
-        "<b>Moltbot Watcher Commands</b>\n\n"
-        "/status - Check Moltbot status\n"
-        "/kill - Stop Moltbot gateway\n"
-        "/start_moltbot - Start Moltbot gateway\n"
-        "/mute [minutes] - Mute alerts\n"
-        "/unmute - Unmute alerts\n"
-        "/recent - Show recent inputs\n"
-        "/help - Show this help",
-        parse_mode="HTML",
-    )
-
-
-def get_watch_directories(watch_patterns: list[str]) -> list[str]:
-    """Expand glob patterns to get directories to watch."""
-    from glob import glob
-
-    directories = set()
-    for pattern in watch_patterns:
-        # Get the base directory before any wildcards
-        parts = pattern.split("*")[0].rstrip("/")
-        if os.path.isdir(parts):
-            directories.add(parts)
-        else:
-            # Try parent directory
-            parent = os.path.dirname(parts)
-            if os.path.isdir(parent):
-                directories.add(parent)
-
-        # Also add any currently matching directories
-        for match in glob(pattern):
-            if os.path.isfile(match):
-                directories.add(os.path.dirname(match))
-            elif os.path.isdir(match):
-                directories.add(match)
-
-    return list(directories)
-
-
-async def main():
+def main():
     """Main entry point."""
-    # Load configuration
-    config_path = os.environ.get(
-        "MOLTBOT_WATCHER_CONFIG",
-        os.path.expanduser("~/.config/moltbot-watcher/config.yaml"),
-    )
+    # Check for config file argument
+    config_path = None
+    if len(sys.argv) > 1:
+        config_path = sys.argv[1]
 
-    if not os.path.exists(config_path):
-        logger.error(f"Config file not found: {config_path}")
+    try:
+        config = Config(config_path)
+    except FileNotFoundError:
+        logger.error(
+            "Config file not found. Please create ~/.config/moltbot-watcher/config.yaml"
+        )
         sys.exit(1)
-
-    config = Config(config_path)
+    except Exception as e:
+        logger.error(f"Failed to load config: {e}")
+        sys.exit(1)
 
     # Validate config
-    if config.bot_token == "YOUR_BOT_TOKEN":
-        logger.error("Please configure your Telegram bot token in config.yaml")
+    if "YOUR_" in config.bot_token or "YOUR_" in config.chat_id:
+        logger.error("Please configure your Telegram bot token and chat ID")
         sys.exit(1)
 
-    if config.chat_id == "YOUR_CHAT_ID":
-        logger.error("Please configure your Telegram chat ID in config.yaml")
-        sys.exit(1)
-
-    # Create watcher
-    watcher = MoltbotWatcher(config)
-
-    # Create Telegram application
-    app = Application.builder().token(config.bot_token).build()
-    app.bot_data["watcher"] = watcher
-    watcher.app = app
-
-    # Add command handlers
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("kill", cmd_kill))
-    app.add_handler(CommandHandler("start_moltbot", cmd_start_moltbot))
-    app.add_handler(CommandHandler("mute", cmd_mute))
-    app.add_handler(CommandHandler("unmute", cmd_unmute))
-    app.add_handler(CommandHandler("recent", cmd_recent))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("start", cmd_help))  # Telegram default
-
-    # Set up file watching
-    loop = asyncio.get_event_loop()
-    event_handler = FileChangeHandler(watcher, loop)
-    observer = Observer()
-
-    watch_dirs = get_watch_directories(config.watch_paths)
-    if not watch_dirs:
-        logger.warning("No watch directories found, creating default")
-        default_dir = os.path.expanduser("~/.moltbot/agents")
-        os.makedirs(default_dir, exist_ok=True)
-        watch_dirs = [default_dir]
-
-    for directory in watch_dirs:
-        logger.info(f"Watching directory: {directory}")
-        observer.schedule(event_handler, directory, recursive=True)
-
-    observer.start()
-
-    # Send startup message
-    try:
-        await app.bot.send_message(
-            chat_id=config.chat_id,
-            text="<b>Moltbot Watcher Started</b>\n\nMonitoring for new inputs...",
-            parse_mode="HTML",
-        )
-    except Exception as e:
-        logger.error(f"Failed to send startup message: {e}")
-
-    # Start polling
-    logger.info("Starting Telegram bot polling...")
-    try:
-        await app.initialize()
-        await app.start()
-        await app.updater.start_polling(drop_pending_updates=True)
-
-        # Keep running
-        while True:
-            await asyncio.sleep(1)
-
-    except KeyboardInterrupt:
-        logger.info("Shutting down...")
-    finally:
-        observer.stop()
-        observer.join()
-        await app.stop()
-        await app.shutdown()
+    bot = WatcherBot(config)
+    bot.run()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
